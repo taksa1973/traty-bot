@@ -35,6 +35,28 @@ function mainKb() {
   };
 }
 
+// Быстрые категории (кнопками при добавлении траты без описания)
+const QUICK_CATS = [
+  ["🍔 Еда", "Еда"], ["🚕 Транспорт", "Транспорт"], ["🏠 Дом", "Дом"],
+  ["🎉 Досуг", "Досуг"], ["💊 Здоровье", "Здоровье"], ["🛒 Покупки", "Покупки"],
+  ["📦 Прочее", "Прочее"],
+];
+function categoryKb() {
+  const rows = [];
+  for (let i = 0; i < QUICK_CATS.length; i += 2) {
+    const r = [{ text: QUICK_CATS[i][0], callback_data: `cat:${i}` }];
+    if (QUICK_CATS[i + 1]) r.push({ text: QUICK_CATS[i + 1][0], callback_data: `cat:${i + 1}` });
+    rows.push(r);
+  }
+  return { inline_keyboard: rows };
+}
+// Эмодзи-полоса для «графиков» в сводке
+export function bar(frac, width = 10) {
+  const f = Math.max(0, Math.min(1, isFinite(frac) ? frac : 0));
+  const filled = Math.round(f * width);
+  return "█".repeat(filled) + "░".repeat(width - filled);
+}
+
 const esc = (s) =>
   String(s == null ? "" : s)
     .replace(/&/g, "&amp;")
@@ -126,6 +148,7 @@ function defaultUser(from) {
     first_name: from.first_name || "",
     monthly_income: 100000,
     work_hours: 160,
+    monthly_budget: 0,
     currency: "₽",
     tz: "America/Sao_Paulo",
     reminder_hour: 21,
@@ -502,7 +525,8 @@ function welcomeText(isAdmin) {
     `${BTN.CALC} — посчитать часы, ничего не записывая\n` +
     `${BTN.DEBTS} — долги (я должен / мне должны)\n` +
     `${BTN.SUMMARY} — сколько и на что ушло за месяц\n` +
-    `${BTN.SETTINGS} — доход, часы, валюта, напоминания\n\n` +
+    `${BTN.SETTINGS} — доход, часы, валюта, напоминания, бюджет, экспорт\n\n` +
+    "💡 Ещё: бюджет-лимит на месяц, экспорт трат в CSV, эмодзи-графики в сводке.\n\n" +
     "Каждый вечер напомню записать траты, в конце месяца пришлю сводку 📊";
   if (isAdmin)
     t += "\n\n👑 Ты — <b>главный админ</b>. Буду сообщать тебе о новых пользователях.";
@@ -511,11 +535,52 @@ function welcomeText(isAdmin) {
 
 async function expenseSavedText(env, u, amount, cat, hours, ym) {
   const { total, n } = await monthTotal(env, u.id, ym);
-  return (
+  let text =
     `✅ Записал: <b>${esc(fmtMoney(amount, u.currency))}</b> — ${esc(cat)}\n` +
     `⏱ Это ≈ <b>${esc(fmtHours(hours))}</b> твоего времени\n` +
-    `💰 За ${ymDisplay(ym)}: ${esc(fmtMoney(total, u.currency))} (${n} трат)`
-  );
+    `💰 За ${ymDisplay(ym)}: ${esc(fmtMoney(total, u.currency))} (${n} трат)`;
+  const budget = u.monthly_budget || 0;
+  if (budget > 0) {
+    const left = budget - total;
+    if (left < 0)
+      text += `\n🚨 Бюджет ${esc(fmtMoney(budget, u.currency))} превышен на ${esc(fmtMoney(-left, u.currency))}`;
+    else
+      text += `\n🎯 До лимита осталось ${esc(fmtMoney(left, u.currency))} из ${esc(fmtMoney(budget, u.currency))}`;
+  }
+  return text;
+}
+
+// Экспорт всех трат пользователя в CSV-файл
+async function exportCsv(env, u, chatId) {
+  const rows = await listRawExpenses(env, u.id, "");
+  if (!rows.length) {
+    await send(env, chatId, "Пока нечего экспортировать — трат нет.");
+    return;
+  }
+  const recs = [];
+  for (const r of rows) {
+    const parts = r.key.split(":"); // exp:userid:ymd:id
+    recs.push({
+      ymd: parts[2],
+      amount: await decAmount(env, r.amount),
+      category: (await dec(env, r.category)) || "",
+      note: (await dec(env, r.note)) || "",
+      ts: r.ts || "",
+    });
+  }
+  recs.sort((a, b) => (a.ymd + a.ts < b.ymd + b.ts ? -1 : 1));
+  const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
+  let csv = "Дата;Категория;Заметка;Сумма\n";
+  let total = 0;
+  for (const r of recs) {
+    csv += `${r.ymd};${q(r.category)};${q(r.note)};${r.amount}\n`;
+    total += r.amount;
+  }
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("caption", `📤 Экспорт трат: ${recs.length} шт., всего ${fmtMoney(total, u.currency)}`);
+  form.append("document", new Blob(["﻿" + csv], { type: "text/csv" }), "traty.csv");
+  await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendDocument`, { method: "POST", body: form });
 }
 
 async function summaryText(env, u, ym) {
@@ -535,12 +600,23 @@ async function summaryText(env, u, ym) {
         fmtMoney(u.monthly_income, cur)
       )})`
     );
+  const budget = u.monthly_budget || 0;
+  if (budget > 0) {
+    const used = total / budget;
+    lines.push(
+      `\n🎯 Бюджет: <b>${esc(fmtMoney(total, cur))}</b> из ${esc(fmtMoney(budget, cur))} (${Math.round(used * 100)}%)`
+    );
+    lines.push(`<code>${bar(used, 12)}</code>${total > budget ? " 🚨" : ""}`);
+  }
   lines.push("\n<b>По категориям:</b>");
   const br = await monthBreakdown(env, u.id, ym);
-  for (const row of br.slice(0, 12)) {
-    const share = total ? Math.round((row.s / total) * 100) : 0;
-    lines.push(`• ${esc(row.category)} — ${esc(fmtMoney(row.s, cur))} (${share}%, ${row.n})`);
+  for (const row of br.slice(0, 8)) {
+    const share = total ? row.s / total : 0;
+    lines.push(
+      `<code>${bar(share, 8)}</code> ${esc(row.category)} — ${esc(fmtMoney(row.s, cur))} (${Math.round(share * 100)}%)`
+    );
   }
+  if (br.length > 8) lines.push(`…и ещё ${br.length - 8} категорий`);
   return lines.join("\n");
 }
 
@@ -630,6 +706,13 @@ async function settingsKb(env, u) {
     [{ text: `💱 Валюта: ${cur}`, callback_data: "set:currency" }],
     [{ text: `⏰ Напоминание: ${rem}`, callback_data: "set:reminder" }],
     [{ text: `Ежедневное напоминание: ${daily}`, callback_data: "set:daily" }],
+    [
+      {
+        text: `🎯 Бюджет/мес: ${(u.monthly_budget || 0) > 0 ? fmtMoney(u.monthly_budget, cur) : "не задан"}`,
+        callback_data: "set:budget",
+      },
+    ],
+    [{ text: "📤 Экспорт трат (CSV)", callback_data: "set:export" }],
   ];
   if ((await getAdminId(env)) === u.id) {
     const cnt = (await allUsers(env)).length;
@@ -643,17 +726,31 @@ const undoKb = (ymd, id) => ({
 });
 
 // ==== Сохранение траты ===================================================
-async function saveAndReply(env, u, chatId, amount, note) {
+async function doSaveExpense(env, u, amount, note) {
   const parts = localParts(u.tz);
   const cat = categoryOf(note);
   const id = await addExpense(env, u.id, amount, cat, note, parts.ymd);
   const hours = hoursFor(amount, u.monthly_income, u.work_hours);
-  await send(
-    env,
-    chatId,
-    await expenseSavedText(env, u, amount, cat, hours, parts.ym),
-    undoKb(parts.ymd, id)
-  );
+  const text = await expenseSavedText(env, u, amount, cat, hours, parts.ym);
+  return { text, kb: undoKb(parts.ymd, id) };
+}
+
+// Есть описание → сохраняем сразу; нет → предлагаем категорию кнопками
+async function handleAmount(env, u, chatId, p) {
+  if (p.note) {
+    const r = await doSaveExpense(env, u, p.amount, p.note);
+    await send(env, chatId, r.text, r.kb);
+  } else {
+    u.state = "expense_category";
+    u.state_data = { amount: p.amount };
+    await saveUser(env, u);
+    await send(
+      env,
+      chatId,
+      `Сумма <b>${esc(fmtMoney(p.amount, u.currency))}</b>. Выбери категорию 👇\n(или просто напиши свою)`,
+      categoryKb()
+    );
+  }
 }
 
 // ==== Обработка сообщений ================================================
@@ -733,7 +830,7 @@ async function onMessage(env, msg) {
     }
     user.state = null;
     await saveUser(env, user);
-    await saveAndReply(env, user, chatId, p.amount, p.note);
+    await handleAmount(env, user, chatId, p);
     return;
   }
   if (st === "calc") {
@@ -754,6 +851,48 @@ async function onMessage(env, msg) {
       `💸 ${esc(fmtMoney(p.amount, user.currency))}\n⏱ Это <b>${esc(fmtHours(hours))}</b> твоего времени${extra}`,
       mainKb()
     );
+    return;
+  }
+  if (st === "expense_category") {
+    const sd = user.state_data || {};
+    user.state = null;
+    user.state_data = null;
+    await saveUser(env, user);
+    if (!sd.amount) {
+      const p2 = parseAmount(text);
+      if (p2) {
+        await handleAmount(env, user, chatId, p2);
+        return;
+      }
+      await send(env, chatId, "Пришли сумму, напр. <code>500 такси</code>", mainKb());
+      return;
+    }
+    const r = await doSaveExpense(env, user, sd.amount, text.trim());
+    await send(env, chatId, r.text, r.kb);
+    return;
+  }
+  if (st === "set_budget") {
+    const t = (text || "").trim();
+    let val;
+    if (/^0([.,]0*)?$/.test(t)) val = 0;
+    else {
+      const p = parseAmount(t);
+      if (!p) {
+        await send(env, chatId, "Пришли число, напр. <code>80000</code> (или <code>0</code>, чтобы снять лимит).");
+        return;
+      }
+      val = p.amount;
+    }
+    user.state = null;
+    user.monthly_budget = val;
+    await saveUser(env, user);
+    await send(
+      env,
+      chatId,
+      val > 0 ? `🎯 Бюджет на месяц: <b>${esc(fmtMoney(val, user.currency))}</b>.` : "🎯 Лимит бюджета снят.",
+      mainKb()
+    );
+    await send(env, chatId, settingsText(), await settingsKb(env, user));
     return;
   }
   if (st === "debt_counterparty") {
@@ -876,6 +1015,21 @@ async function onCallback(env, cq) {
   if (isNew) await onNewUser(env, from);
   const data = cq.data || "";
 
+  if (data.startsWith("cat:")) {
+    const i = parseInt(data.slice(4), 10);
+    const sd = user.state_data || {};
+    if (!sd.amount || !QUICK_CATS[i]) {
+      await answerCb(env, cq.id, "Устарело — пришли сумму заново");
+      return;
+    }
+    user.state = null;
+    user.state_data = null;
+    await saveUser(env, user);
+    const r = await doSaveExpense(env, user, sd.amount, QUICK_CATS[i][1]);
+    await safeEdit(env, cq, r.text, r.kb);
+    await answerCb(env, cq.id, "Записал ✅");
+    return;
+  }
   if (data.startsWith("d:add:")) {
     const direction = data.slice("d:add:".length);
     user.state = "debt_counterparty";
@@ -919,6 +1073,19 @@ async function onCallback(env, cq) {
     await saveUser(env, user);
     await send(env, from.id, map[data][1]);
     await answerCb(env, cq.id);
+    return;
+  }
+  if (data === "set:budget") {
+    user.state = "set_budget";
+    user.state_data = null;
+    await saveUser(env, user);
+    await send(env, from.id, "Введи <b>бюджет на месяц</b> (число). <code>0</code> — снять лимит.\n(/cancel — отмена)");
+    await answerCb(env, cq.id);
+    return;
+  }
+  if (data === "set:export") {
+    await answerCb(env, cq.id, "Готовлю файл…");
+    await exportCsv(env, user, from.id);
     return;
   }
   if (data === "set:daily") {

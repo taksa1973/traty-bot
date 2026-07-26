@@ -1,0 +1,16 @@
+# Конфиг для деплоя воркера (используется GitHub Action через wrangler).
+# Секреты (BOT_TOKEN, DB_KEY, WEBHOOK_SECRET) здесь НЕ указываются — они
+# заданы в Cloudflare и сохраняются при каждом деплое.
+name = "traty-bot"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+account_id = "591c274857877a72361735344302bbeb"
+
+# Хранилище (id — не секрет, это идентификатор ресурса)
+[[kv_namespaces]]
+binding = "KV"
+id = "b7ce809df26a464bbb4a3ef2cf205e98"
+
+# Напоминания и месячная сводка — каждую минуту
+[triggers]
+crons = ["* * * * *"]

@@ -1,7 +1,7 @@
 // Тест чистой логики воркера (без Cloudflare-окружения).
 import {
   parseAmount, toFloat, categoryOf, parseHHMM, parseDueDate,
-  hoursFor, fmtMoney, fmtHours, isoToDisplay, ymDisplay, prevYm,
+  hoursFor, fmtMoney, fmtHours, isoToDisplay, ymDisplay, prevYm, bar,
 } from "./worker.js";
 
 let ok = 0, fail = 0;
@@ -60,6 +60,13 @@ check("iso→display", isoToDisplay("2026-08-15") === "15.08.2026");
 check("ym display", ymDisplay("2026-07") === "июль 2026");
 check("prevYm год", prevYm("2026-01") === "2025-12");
 check("toFloat 1.234,56", Math.abs(toFloat("1.234,56") - 1234.56) < 1e-9);
+
+// bar (эмодзи-график)
+check("bar 0", bar(0, 10) === "░".repeat(10));
+check("bar 1", bar(1, 10) === "█".repeat(10));
+check("bar 0.5", bar(0.5, 10) === "█████░░░░░");
+check("bar >1 клампится", bar(2, 4) === "████");
+check("bar NaN", bar(NaN, 4) === "░░░░");
 
 console.log(`\nИТОГО: ${ok} ok, ${fail} fail`);
 process.exit(fail ? 1 : 0);

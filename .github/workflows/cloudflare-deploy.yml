@@ -1,0 +1,23 @@
+name: Deploy to Cloudflare
+
+# Каждый push в main, затрагивающий cloudflare/, обновляет воркер.
+# Нужен один секрет репозитория: CLOUDFLARE_API_TOKEN.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cloudflare/**"
+      - ".github/workflows/cloudflare-deploy.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          workingDirectory: cloudflare
