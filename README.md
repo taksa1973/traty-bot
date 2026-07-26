@@ -62,6 +62,53 @@ sudo systemctl enable --now traty-bot
 journalctl -u traty-bot -f        # логи
 ```
 
+## Деплой на Fly.io (облако, автообновление из GitHub)
+
+Бот будет работать 24/7 без твоего компа, а каждый `git push` в `main` —
+автоматически обновлять его. Образ собирается на серверах Fly, локальный
+Docker не нужен. Файлы `Dockerfile`, `fly.toml`, `.dockerignore` и GitHub
+Action уже в репозитории.
+
+> Fly просит привязать банковскую карту даже для мелкого бесплатного лимита.
+> Крошечная машина (256 МБ) + том 1 ГБ стоят копейки или попадают в бесплатный лимит.
+
+**Разовая настройка (делается один раз, в папке `traty-bot`):**
+
+```bash
+# 1. Установить flyctl и войти (создать аккаунт)
+brew install flyctl
+fly auth signup            # или: fly auth login
+
+# 2. Создать приложение по готовому fly.toml (имя должно быть уникальным)
+fly launch --no-deploy --copy-config --name traty-bot-ЯРОСЛАВ --region gru
+
+# 3. Постоянный том для зашифрованной базы (имя = source в fly.toml)
+fly volumes create traty_data --region gru --size 1
+
+# 4. Секреты (в образ они не попадают, только в Fly).
+#    DB_KEY возьми ТОТ ЖЕ, что в локальном .env — тогда ключ один.
+fly secrets set BOT_TOKEN=ТВОЙ_ТОКЕН DB_KEY=ТВОЙ_КЛЮЧ_ИЗ_ENV
+
+# 5. Первый деплой
+fly deploy --remote-only
+
+# 6. Логи
+fly logs
+```
+
+**Включить авто-деплой из GitHub (после первого `fly deploy`):**
+
+```bash
+fly tokens create deploy      # скопируй выданный токен
+```
+Затем: GitHub → репозиторий → **Settings → Secrets and variables → Actions →
+New repository secret** → имя `FLY_API_TOKEN`, значение — токен из команды выше.
+Теперь каждый `git push origin main` сам разворачивает новую версию.
+
+> ⚠️ **Важно:** нельзя, чтобы бот работал одновременно в двух местах — Telegram
+> отдаёт сообщения только одному «слушателю», иначе ошибка 409. Когда бот
+> заработает на Fly — **останови локальный:** `pkill -f "traty-bot.*bot.py"`.
+
 ## Безопасность данных
 
 - **Токен** и **ключ шифрования** лежат только в `.env` — файл в `.gitignore`,

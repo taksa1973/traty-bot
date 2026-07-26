@@ -1,0 +1,14 @@
+# Секреты и локальные данные НИКОГДА не попадают в образ
+.env
+data.db
+data.db-wal
+data.db-shm
+bot.log
+
+# Мусор
+.git/
+venv/
+__pycache__/
+*.pyc
+_selftest*.py
+.github/

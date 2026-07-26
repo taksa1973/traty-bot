@@ -1,0 +1,23 @@
+# Конфиг Fly.io для бота учёта трат.
+# Имя app должно быть уникальным во всём Fly — при первом `fly launch`
+# можно задать своё через --name. HTTP-сервиса нет: бот работает через
+# long-polling, поэтому порты наружу не открываются.
+
+app = "traty-bot"
+primary_region = "gru"        # São Paulo — ближайший регион к Рио
+
+[build]
+
+[env]
+  DB_PATH = "/data/data.db"
+
+# Постоянный том: зашифрованная база переживает рестарты и деплои.
+# source должен совпадать с именем тома из `fly volumes create traty_data`.
+[mounts]
+  source = "traty_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  cpus = 1
