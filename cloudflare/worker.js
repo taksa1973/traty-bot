@@ -230,6 +230,21 @@ async function deleteExpense(env, userId, ymd, id) {
   await env.KV.delete(key);
   return true;
 }
+async function getExpense(env, userId, ymd, id) {
+  const v = await env.KV.get(`exp:${userId}:${ymd}:${id}`);
+  return v ? JSON.parse(v) : null;
+}
+async function updateExpense(env, userId, ymd, id, amount, category, note) {
+  const key = `exp:${userId}:${ymd}:${id}`;
+  const v = await env.KV.get(key); // ключ содержит userId → чужую трату не тронуть
+  if (!v) return false;
+  const rec = JSON.parse(v);
+  rec.amount = await enc(env, amount);
+  rec.category = await enc(env, category);
+  rec.note = await enc(env, note);
+  await env.KV.put(key, JSON.stringify(rec));
+  return true;
+}
 async function listRawExpenses(env, userId, datePrefix) {
   const out = [];
   let cursor;
@@ -620,9 +635,9 @@ async function summaryText(env, u, ym) {
   return lines.join("\n");
 }
 
-async function todayText(env, u, ymd, dm) {
+async function todayText(env, u, ymd, dm, rows) {
   const cur = u.currency;
-  const rows = await dayExpenses(env, u.id, ymd);
+  if (!rows) rows = await dayExpenses(env, u.id, ymd);
   const head = `📅 <b>Сегодня, ${dm}</b>\n\n`;
   if (!rows.length) return head + "Сегодня трат пока нет. Пришли сумму — запишу.";
   let total = 0;
@@ -722,8 +737,22 @@ async function settingsKb(env, u) {
 }
 
 const undoKb = (ymd, id) => ({
-  inline_keyboard: [[{ text: "↩️ Удалить эту трату", callback_data: `x:del:${ymd}:${id}` }]],
+  inline_keyboard: [[
+    { text: "✏️ Изменить", callback_data: `x:edit:${ymd}:${id}` },
+    { text: "↩️ Удалить", callback_data: `x:del:${ymd}:${id}` },
+  ]],
 });
+// Клавиатура списка «Сегодня»: у каждой траты — кнопка редактирования
+function todayKb(ymd, rows, cur) {
+  const kb = rows.slice(0, 10).map((r) => [
+    {
+      text: `✏️ ${fmtMoney(r.amount, cur)} · ${r.category || "Прочее"}`.slice(0, 60),
+      callback_data: `x:edit:${ymd}:${r.id}`,
+    },
+  ]);
+  kb.push([{ text: "◀ К сводке за месяц", callback_data: `s:m:${ymd.slice(0, 7)}` }]);
+  return { inline_keyboard: kb };
+}
 
 // ==== Сохранение траты ===================================================
 async function doSaveExpense(env, u, amount, note) {
@@ -869,6 +898,49 @@ async function onMessage(env, msg) {
     }
     const r = await doSaveExpense(env, user, sd.amount, text.trim());
     await send(env, chatId, r.text, r.kb);
+    return;
+  }
+  if (st === "edit_expense") {
+    const p = parseAmount(text);
+    if (!p) {
+      await send(env, chatId, "Пришли число, напр. <code>700 такси</code>");
+      return;
+    }
+    const sd = user.state_data || {};
+    user.state = null;
+    user.state_data = null;
+    await saveUser(env, user);
+    if (!sd.ymd || !sd.id) {
+      await send(env, chatId, "Не понял, какую трату менять. Открой её заново.", mainKb());
+      return;
+    }
+    let category, note;
+    if (p.note) {
+      category = categoryOf(p.note);
+      note = p.note;
+    } else {
+      const exp = await getExpense(env, user.id, sd.ymd, sd.id);
+      category = exp ? (await dec(env, exp.category)) || "Прочее" : "Прочее";
+      note = exp ? (await dec(env, exp.note)) || "" : "";
+    }
+    const ok = await updateExpense(env, user.id, sd.ymd, sd.id, p.amount, category, note);
+    if (!ok) {
+      await send(env, chatId, "Трата не найдена — возможно, удалена.", mainKb());
+      return;
+    }
+    const ym = sd.ymd.slice(0, 7);
+    const { total } = await monthTotal(env, user.id, ym);
+    let text2 =
+      `✏️ Изменил: <b>${esc(fmtMoney(p.amount, user.currency))}</b> — ${esc(category)}\n` +
+      `💰 За ${ymDisplay(ym)}: ${esc(fmtMoney(total, user.currency))}`;
+    const budget = user.monthly_budget || 0;
+    if (budget > 0) {
+      const left = budget - total;
+      text2 += left < 0
+        ? `\n🚨 Бюджет превышен на ${esc(fmtMoney(-left, user.currency))}`
+        : `\n🎯 До лимита осталось ${esc(fmtMoney(left, user.currency))}`;
+    }
+    await send(env, chatId, text2, undoKb(sd.ymd, sd.id));
     return;
   }
   if (st === "set_budget") {
@@ -1056,8 +1128,13 @@ async function onCallback(env, cq) {
   if (data === "s:today") {
     const parts = localParts(user.tz);
     const dm = parts.ymd.slice(8) + "." + parts.ymd.slice(5, 7);
-    const kb = { inline_keyboard: [[{ text: "◀ К сводке за месяц", callback_data: `s:m:${parts.ym}` }]] };
-    await safeEdit(env, cq, await todayText(env, user, parts.ymd, dm), kb);
+    const rows = await dayExpenses(env, user.id, parts.ymd);
+    await safeEdit(
+      env,
+      cq,
+      await todayText(env, user, parts.ymd, dm, rows),
+      todayKb(parts.ymd, rows, user.currency)
+    );
     await answerCb(env, cq.id);
     return;
   }
@@ -1116,6 +1193,31 @@ async function onCallback(env, cq) {
   }
   if (data === "set:back") {
     await safeEdit(env, cq, settingsText(), await settingsKb(env, user));
+    await answerCb(env, cq.id);
+    return;
+  }
+  if (data.startsWith("x:edit:")) {
+    const rest = data.slice("x:edit:".length);
+    const idx = rest.indexOf(":");
+    const ymd = rest.slice(0, idx);
+    const id = rest.slice(idx + 1);
+    const exp = await getExpense(env, from.id, ymd, id);
+    if (!exp) {
+      await answerCb(env, cq.id, "Не найдено (возможно, удалено)");
+      return;
+    }
+    const curAmount = await decAmount(env, exp.amount);
+    const curCat = (await dec(env, exp.category)) || "Прочее";
+    user.state = "edit_expense";
+    user.state_data = { ymd, id };
+    await saveUser(env, user);
+    await send(
+      env,
+      from.id,
+      `✏️ Редактирую: <b>${esc(fmtMoney(curAmount, user.currency))}</b> — ${esc(curCat)}\n\n` +
+        "Пришли новое значение — сумму и описание, напр. <code>700 такси</code>.\n" +
+        "Если пришлёшь только сумму — категория останется прежней.\n(/cancel — отмена)"
+    );
     await answerCb(env, cq.id);
     return;
   }
