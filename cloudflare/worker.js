@@ -264,6 +264,30 @@ async function monthTotal(env, userId, ym) {
   for (const r of rows) total += await decAmount(env, r.amount);
   return { total, n: rows.length };
 }
+
+// Итог за месяц с гарантированным учётом одной свежей траты.
+// KV.list отдаёт данные с задержкой, поэтому только что добавленную трату
+// (или новую сумму отредактированной) подставляем явно по её id.
+async function monthTotalWith(env, userId, ym, overrideId, overrideAmount) {
+  const rows = await listRawExpenses(env, userId, ym);
+  let total = 0;
+  let n = 0;
+  let seen = false;
+  for (const r of rows) {
+    if (overrideId && r.id === overrideId) {
+      total += overrideAmount;
+      seen = true;
+    } else {
+      total += await decAmount(env, r.amount);
+    }
+    n += 1;
+  }
+  if (overrideId && !seen) {
+    total += overrideAmount;
+    n += 1;
+  }
+  return { total, n };
+}
 async function dayTotal(env, userId, ymd) {
   const rows = await listRawExpenses(env, userId, ymd);
   let total = 0;
@@ -548,23 +572,6 @@ function welcomeText(isAdmin) {
   return t;
 }
 
-async function expenseSavedText(env, u, amount, cat, hours, ym) {
-  const { total, n } = await monthTotal(env, u.id, ym);
-  let text =
-    `✅ Записал: <b>${esc(fmtMoney(amount, u.currency))}</b> — ${esc(cat)}\n` +
-    `⏱ Это ≈ <b>${esc(fmtHours(hours))}</b> твоего времени\n` +
-    `💰 За ${ymDisplay(ym)}: ${esc(fmtMoney(total, u.currency))} (${n} трат)`;
-  const budget = u.monthly_budget || 0;
-  if (budget > 0) {
-    const left = budget - total;
-    if (left < 0)
-      text += `\n🚨 Бюджет ${esc(fmtMoney(budget, u.currency))} превышен на ${esc(fmtMoney(-left, u.currency))}`;
-    else
-      text += `\n🎯 До лимита осталось ${esc(fmtMoney(left, u.currency))} из ${esc(fmtMoney(budget, u.currency))}`;
-  }
-  return text;
-}
-
 // Экспорт всех трат пользователя в CSV-файл
 async function exportCsv(env, u, chatId) {
   const rows = await listRawExpenses(env, u.id, "");
@@ -760,8 +767,23 @@ async function doSaveExpense(env, u, amount, note) {
   const cat = categoryOf(note);
   const id = await addExpense(env, u.id, amount, cat, note, parts.ymd);
   const hours = hoursFor(amount, u.monthly_income, u.work_hours);
-  const text = await expenseSavedText(env, u, amount, cat, hours, parts.ym);
+  const { total, n } = await monthTotalWith(env, u.id, parts.ym, id, amount);
+  let text =
+    `✅ Записал: <b>${esc(fmtMoney(amount, u.currency))}</b> — ${esc(cat)}\n` +
+    `⏱ Это ≈ <b>${esc(fmtHours(hours))}</b> твоего времени\n` +
+    `💰 За ${ymDisplay(parts.ym)}: ${esc(fmtMoney(total, u.currency))} (${n} трат)`;
+  text += budgetLine(u, total);
   return { text, kb: undoKb(parts.ymd, id) };
+}
+
+// Строка про бюджет для подтверждений (пусто, если лимит не задан)
+function budgetLine(u, total) {
+  const budget = u.monthly_budget || 0;
+  if (budget <= 0) return "";
+  const left = budget - total;
+  return left < 0
+    ? `\n🚨 Бюджет ${esc(fmtMoney(budget, u.currency))} превышен на ${esc(fmtMoney(-left, u.currency))}`
+    : `\n🎯 До лимита осталось ${esc(fmtMoney(left, u.currency))} из ${esc(fmtMoney(budget, u.currency))}`;
 }
 
 // Есть описание → сохраняем сразу; нет → предлагаем категорию кнопками
@@ -929,17 +951,11 @@ async function onMessage(env, msg) {
       return;
     }
     const ym = sd.ymd.slice(0, 7);
-    const { total } = await monthTotal(env, user.id, ym);
+    const { total } = await monthTotalWith(env, user.id, ym, sd.id, p.amount);
     let text2 =
       `✏️ Изменил: <b>${esc(fmtMoney(p.amount, user.currency))}</b> — ${esc(category)}\n` +
       `💰 За ${ymDisplay(ym)}: ${esc(fmtMoney(total, user.currency))}`;
-    const budget = user.monthly_budget || 0;
-    if (budget > 0) {
-      const left = budget - total;
-      text2 += left < 0
-        ? `\n🚨 Бюджет превышен на ${esc(fmtMoney(-left, user.currency))}`
-        : `\n🎯 До лимита осталось ${esc(fmtMoney(left, user.currency))}`;
-    }
+    text2 += budgetLine(user, total);
     await send(env, chatId, text2, undoKb(sd.ymd, sd.id));
     return;
   }
