@@ -155,6 +155,7 @@ function defaultUser(from) {
     reminder_min: 0,
     daily_reminder: 1,
     active: 1,
+    indexed: true,
     last_evening_date: null,
     last_month_summary: null,
     state: null,
@@ -168,6 +169,21 @@ async function getUser(env, id) {
 }
 async function saveUser(env, u) {
   await env.KV.put(`user:${u.id}`, JSON.stringify(u));
+}
+// Индекс id пользователей в одном ключе — чтобы cron и админ-счётчик
+// не делали KV.list (у него дневной лимит 1000 на бесплатном плане).
+async function addToIndex(env, id) {
+  const raw = await env.KV.get("idx:users");
+  let arr;
+  try {
+    arr = raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    arr = [];
+  }
+  if (!arr.includes(id)) {
+    arr.push(id);
+    await env.KV.put("idx:users", JSON.stringify(arr));
+  }
 }
 async function ensureUser(env, from) {
   const existing = await getUser(env, from.id);
@@ -186,27 +202,35 @@ async function ensureUser(env, from) {
       existing.active = 1;
       changed = true;
     }
+    if (!existing.indexed) {
+      existing.indexed = true;
+      changed = true;
+      await addToIndex(env, from.id); // самолечение индекса для старых пользователей
+    }
     if (changed) await saveUser(env, existing);
     return { user: existing, isNew: false };
   }
   const u = defaultUser(from);
   await saveUser(env, u);
+  await addToIndex(env, from.id);
   return { user: u, isNew: true };
 }
 async function allUsers(env, activeOnly) {
+  const raw = await env.KV.get("idx:users");
+  let ids;
+  try {
+    ids = raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    ids = [];
+  }
   const out = [];
-  let cursor;
-  do {
-    const res = await env.KV.list({ prefix: "user:", cursor });
-    for (const k of res.keys) {
-      const v = await env.KV.get(k.name);
-      if (v) {
-        const u = JSON.parse(v);
-        if (!activeOnly || u.active === 1) out.push(u);
-      }
+  for (const id of ids) {
+    const v = await env.KV.get(`user:${id}`);
+    if (v) {
+      const u = JSON.parse(v);
+      if (!activeOnly || u.active === 1) out.push(u);
     }
-    cursor = res.list_complete ? null : res.cursor;
-  } while (cursor);
+  }
   return out;
 }
 
@@ -607,9 +631,20 @@ async function exportCsv(env, u, chatId) {
 
 async function summaryText(env, u, ym) {
   const cur = u.currency;
-  const { total, n } = await monthTotal(env, u.id, ym);
+  const rows = await listRawExpenses(env, u.id, ym); // один list на всю сводку
   const head = `📊 <b>Сводка — ${ymDisplay(ym)}</b>\n\n`;
-  if (n === 0) return head + "Трат в этом месяце ещё нет.";
+  if (!rows.length) return head + "Трат в этом месяце ещё нет.";
+  let total = 0;
+  const agg = {};
+  for (const r of rows) {
+    const amt = await decAmount(env, r.amount);
+    total += amt;
+    const cat = (await dec(env, r.category)) || "Прочее";
+    if (!agg[cat]) agg[cat] = { s: 0, n: 0 };
+    agg[cat].s += amt;
+    agg[cat].n += 1;
+  }
+  const n = rows.length;
   const hours = hoursFor(total, u.monthly_income, u.work_hours);
   const lines = [
     head,
@@ -631,7 +666,9 @@ async function summaryText(env, u, ym) {
     lines.push(`<code>${bar(used, 12)}</code>${total > budget ? " 🚨" : ""}`);
   }
   lines.push("\n<b>По категориям:</b>");
-  const br = await monthBreakdown(env, u.id, ym);
+  const br = Object.entries(agg)
+    .map(([category, v]) => ({ category, s: v.s, n: v.n }))
+    .sort((a, b) => b.s - a.s);
   for (const row of br.slice(0, 8)) {
     const share = total ? row.s / total : 0;
     lines.push(
@@ -661,42 +698,44 @@ async function todayText(env, u, ymd, dm, rows) {
   return lines.join("\n");
 }
 
-async function debtsText(env, u) {
+// Раздел «Долги»: один list на текст и клавиатуру сразу.
+async function debtsView(env, u) {
   const cur = u.currency;
   const all = (await listDebts(env, u.id)).filter((d) => !d.settled);
   const iOwe = all.filter((d) => d.direction === "i_owe");
   const toMe = all.filter((d) => d.direction === "owed_to_me");
-  if (!iOwe.length && !toMe.length) return "📌 <b>Долги</b>\n\nАктивных долгов нет 🎉";
-  const lines = ["📌 <b>Долги</b>"];
-  const block = (title, items) => {
-    const s = items.reduce((a, d) => a + d.amount, 0);
-    lines.push(`\n<b>${title}</b> — итого ${esc(fmtMoney(s, cur))}:`);
-    for (const d of items.slice(0, 20)) {
-      const due = isoToDisplay(d.due_date);
-      lines.push(
-        `• ${esc(d.counterparty || "—")} — ${esc(fmtMoney(d.amount, cur))}${due ? ", до " + due : ""}`
-      );
-    }
-    if (items.length > 20) lines.push(`…и ещё ${items.length - 20}`);
-  };
-  if (iOwe.length) block("🔴 Я должен", iOwe);
-  if (toMe.length) block("🟢 Мне должны", toMe);
-  return lines.join("\n");
-}
-async function debtsKb(env, userId) {
+  let text;
+  if (!iOwe.length && !toMe.length) {
+    text = "📌 <b>Долги</b>\n\nАктивных долгов нет 🎉";
+  } else {
+    const lines = ["📌 <b>Долги</b>"];
+    const block = (title, items) => {
+      const s = items.reduce((a, d) => a + d.amount, 0);
+      lines.push(`\n<b>${title}</b> — итого ${esc(fmtMoney(s, cur))}:`);
+      for (const d of items.slice(0, 20)) {
+        const due = isoToDisplay(d.due_date);
+        lines.push(
+          `• ${esc(d.counterparty || "—")} — ${esc(fmtMoney(d.amount, cur))}${due ? ", до " + due : ""}`
+        );
+      }
+      if (items.length > 20) lines.push(`…и ещё ${items.length - 20}`);
+    };
+    if (iOwe.length) block("🔴 Я должен", iOwe);
+    if (toMe.length) block("🟢 Мне должны", toMe);
+    text = lines.join("\n");
+  }
   const rows = [
     [
       { text: "➕ Я должен", callback_data: "d:add:i_owe" },
       { text: "➕ Мне должны", callback_data: "d:add:owed_to_me" },
     ],
   ];
-  const all = (await listDebts(env, userId)).filter((d) => !d.settled);
   for (const d of all.slice(0, 20)) {
     const mark = d.direction === "i_owe" ? "🔴" : "🟢";
     const label = `✅ Закрыть ${mark} ${d.counterparty || "—"} ${Math.round(d.amount)}`;
     rows.push([{ text: label.slice(0, 64), callback_data: `d:settle:${d.id}` }]);
   }
-  return { inline_keyboard: rows };
+  return { text, kb: { inline_keyboard: rows } };
 }
 
 function summaryKb(ym) {
@@ -767,12 +806,17 @@ async function doSaveExpense(env, u, amount, note) {
   const cat = categoryOf(note);
   const id = await addExpense(env, u.id, amount, cat, note, parts.ymd);
   const hours = hoursFor(amount, u.monthly_income, u.work_hours);
-  const { total, n } = await monthTotalWith(env, u.id, parts.ym, id, amount);
   let text =
     `✅ Записал: <b>${esc(fmtMoney(amount, u.currency))}</b> — ${esc(cat)}\n` +
-    `⏱ Это ≈ <b>${esc(fmtHours(hours))}</b> твоего времени\n` +
-    `💰 За ${ymDisplay(parts.ym)}: ${esc(fmtMoney(total, u.currency))} (${n} трат)`;
-  text += budgetLine(u, total);
+    `⏱ Это ≈ <b>${esc(fmtHours(hours))}</b> твоего времени`;
+  try {
+    const { total, n } = await monthTotalWith(env, u.id, parts.ym, id, amount);
+    text += `\n💰 За ${ymDisplay(parts.ym)}: ${esc(fmtMoney(total, u.currency))} (${n} трат)`;
+    text += budgetLine(u, total);
+  } catch (e) {
+    // трата уже записана; месячный итог временно недоступен (напр. лимит KV)
+    text += "\n💾 Записано. Месячный итог посчитаю позже.";
+  }
   return { text, kb: undoKb(parts.ymd, id) };
 }
 
@@ -859,7 +903,7 @@ async function onMessage(env, msg) {
       );
     } else if (text === BTN.DEBTS) {
       await saveUser(env, user);
-      await send(env, chatId, await debtsText(env, user), await debtsKb(env, user.id));
+      { const dv = await debtsView(env, user); await send(env, chatId, dv.text, dv.kb); }
     } else if (text === BTN.SUMMARY) {
       await saveUser(env, user);
       const ym = localParts(user.tz).ym;
@@ -1025,7 +1069,7 @@ async function onMessage(env, msg) {
       chatId,
       `Записал долг: ${who} — ${esc(data.counterparty || "—")} ${esc(fmtMoney(data.amount, user.currency))}${dueS} ✅`
     );
-    await send(env, chatId, await debtsText(env, user), await debtsKb(env, user.id));
+    { const dv = await debtsView(env, user); await send(env, chatId, dv.text, dv.kb); }
     return;
   }
   if (st === "set_income") {
@@ -1132,7 +1176,7 @@ async function onCallback(env, cq) {
     const id = data.slice("d:settle:".length);
     const done = await settleDebt(env, from.id, id);
     await answerCb(env, cq.id, done ? "Закрыто ✅" : "Не найдено");
-    await safeEdit(env, cq, await debtsText(env, user), await debtsKb(env, from.id));
+    { const dv = await debtsView(env, user); await safeEdit(env, cq, dv.text, dv.kb); }
     return;
   }
   if (data.startsWith("s:m:")) {
@@ -1343,7 +1387,15 @@ export default {
             if (update.message) await onMessage(env, update.message);
             else if (update.callback_query) await onCallback(env, update.callback_query);
           } catch (e) {
-            // не роняем вебхук — Telegram иначе будет ретраить
+            // Не роняем вебхук (иначе Telegram будет ретраить), но даём фидбек.
+            const chatId =
+              (update.message && update.message.chat && update.message.chat.id) ||
+              (update.callback_query && update.callback_query.from && update.callback_query.from.id);
+            if (chatId) {
+              try {
+                await send(env, chatId, "⚠️ Временная ошибка (возможно, дневной лимит хранилища). Попробуй ещё раз чуть позже — обычно восстанавливается само.");
+              } catch (e2) {}
+            }
           }
         })()
       );
