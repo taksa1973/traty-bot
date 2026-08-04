@@ -1,7 +1,7 @@
 // Тест чистой логики воркера (без Cloudflare-окружения).
 import {
   parseAmount, toFloat, categoryOf, parseHHMM, parseDueDate,
-  hoursFor, fmtMoney, fmtHours, isoToDisplay, ymDisplay, prevYm, bar,
+  hoursFor, fmtMoney, fmtHours, isoToDisplay, ymDisplay, prevYm, bar, parseOffset,
 } from "./worker.js";
 
 let ok = 0, fail = 0;
@@ -67,6 +67,14 @@ check("bar 1", bar(1, 10) === "█".repeat(10));
 check("bar 0.5", bar(0.5, 10) === "█████░░░░░");
 check("bar >1 клампится", bar(2, 4) === "████");
 check("bar NaN", bar(NaN, 4) === "░░░░");
+
+// parseOffset (часовой пояс «Другой»)
+check("offset +4", parseOffset("+4") === "UTC+4");
+check("offset 4", parseOffset("4") === "UTC+4");
+check("offset -3", parseOffset("-3") === "UTC-3");
+check("offset +5:30", parseOffset("+5:30") === "UTC+5.5");
+check("offset мусор", parseOffset("abc") === null);
+check("offset +20 невалид", parseOffset("+20") === null);
 
 console.log(`\nИТОГО: ${ok} ok, ${fail} fail`);
 process.exit(fail ? 1 : 0);

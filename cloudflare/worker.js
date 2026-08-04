@@ -57,6 +57,49 @@ export function bar(frac, width = 10) {
   return "█".repeat(filled) + "░".repeat(width - filled);
 }
 
+// Часовые пояса (кнопками). Значения — IANA-имена (Intl в Workers их применяет).
+const TZ_LIST = [
+  ["Калининград, UTC+2", "Europe/Kaliningrad"],
+  ["Москва, UTC+3", "Europe/Moscow"],
+  ["Самара, UTC+4", "Europe/Samara"],
+  ["Екатеринбург, UTC+5", "Asia/Yekaterinburg"],
+  ["Омск, UTC+6", "Asia/Omsk"],
+  ["Красноярск, UTC+7", "Asia/Krasnoyarsk"],
+  ["Иркутск, UTC+8", "Asia/Irkutsk"],
+  ["Якутск, UTC+9", "Asia/Yakutsk"],
+  ["Владивосток, UTC+10", "Asia/Vladivostok"],
+  ["Магадан, UTC+11", "Asia/Magadan"],
+  ["Камчатка, UTC+12", "Asia/Kamchatka"],
+  ["Рио, UTC-3", "America/Sao_Paulo"],
+];
+function tzLabel(tz) {
+  const found = TZ_LIST.find((t) => t[1] === tz);
+  if (found) return found[0];
+  if (tz === "America/Sao_Paulo") return "Рио, UTC-3";
+  return tz || "UTC";
+}
+function tzKb() {
+  const rows = [];
+  for (let i = 0; i < TZ_LIST.length; i += 2) {
+    const r = [{ text: TZ_LIST[i][0], callback_data: `tz:${i}` }];
+    if (TZ_LIST[i + 1]) r.push({ text: TZ_LIST[i + 1][0], callback_data: `tz:${i + 1}` });
+    rows.push(r);
+  }
+  rows.push([{ text: "🌐 Другой (ввести смещение)", callback_data: "tz:custom" }]);
+  rows.push([{ text: "◀ Назад", callback_data: "set:back" }]);
+  return { inline_keyboard: rows };
+}
+export function parseOffset(s) {
+  const m = /^\s*([+-]?)(\d{1,2})(?::?(\d{2}))?\s*$/.exec(s || "");
+  if (!m) return null;
+  const sign = m[1] === "-" ? -1 : 1;
+  const h = parseInt(m[2], 10);
+  const mm = m[3] ? parseInt(m[3], 10) : 0;
+  if (h > 14 || mm >= 60) return null;
+  const off = sign * (h + mm / 60);
+  return "UTC" + (off >= 0 ? "+" : "") + off;
+}
+
 const esc = (s) =>
   String(s == null ? "" : s)
     .replace(/&/g, "&amp;")
@@ -150,7 +193,7 @@ function defaultUser(from) {
     work_hours: 160,
     monthly_budget: 0,
     currency: "₽",
-    tz: "America/Sao_Paulo",
+    tz: "Europe/Moscow",
     reminder_hour: 21,
     reminder_min: 0,
     daily_reminder: 1,
@@ -541,11 +584,25 @@ export function prevYm(ym) {
 }
 // Локальные дата/время по таймзоне пользователя
 function localParts(tz) {
+  tz = tz || "UTC";
+  // Ручное смещение вида "UTC+4" / "UTC-3" / "UTC+5.5" — без зависимости от Intl
+  const off = /^UTC([+-]\d+(?:\.\d+)?)$/.exec(tz);
+  if (off) {
+    const d = new Date(Date.now() + parseFloat(off[1]) * 3600000);
+    const ymd = d.toISOString().slice(0, 10);
+    return {
+      ymd,
+      ym: ymd.slice(0, 7),
+      year: d.getUTCFullYear(),
+      hour: d.getUTCHours(),
+      minute: d.getUTCMinutes(),
+    };
+  }
   const now = new Date();
   let p = {};
   try {
     const fmt = new Intl.DateTimeFormat("en-CA", {
-      timeZone: tz || "UTC",
+      timeZone: tz,
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
@@ -766,6 +823,7 @@ async function settingsKb(env, u) {
     [{ text: `🕐 Рабочих часов/мес: ${Math.round(u.work_hours)}`, callback_data: "set:hours" }],
     [{ text: `💱 Валюта: ${cur}`, callback_data: "set:currency" }],
     [{ text: `⏰ Напоминание: ${rem}`, callback_data: "set:reminder" }],
+    [{ text: `🌍 Часовой пояс: ${tzLabel(u.tz)}`, callback_data: "set:tz" }],
     [{ text: `Ежедневное напоминание: ${daily}`, callback_data: "set:daily" }],
     [
       {
@@ -1003,6 +1061,19 @@ async function onMessage(env, msg) {
     await send(env, chatId, text2, undoKb(sd.ymd, sd.id));
     return;
   }
+  if (st === "set_tz_offset") {
+    const tz = parseOffset(text);
+    if (!tz) {
+      await send(env, chatId, "Не понял. Пришли смещение от UTC, напр. <code>+4</code> или <code>-3</code>.");
+      return;
+    }
+    user.state = null;
+    user.tz = tz;
+    await saveUser(env, user);
+    await send(env, chatId, `🌍 Часовой пояс: <b>${esc(tzLabel(tz))}</b>.`, mainKb());
+    await send(env, chatId, settingsText(), await settingsKb(env, user));
+    return;
+  }
   if (st === "set_budget") {
     const t = (text || "").trim();
     let val;
@@ -1210,6 +1281,40 @@ async function onCallback(env, cq) {
     await saveUser(env, user);
     await send(env, from.id, map[data][1]);
     await answerCb(env, cq.id);
+    return;
+  }
+  if (data === "set:tz") {
+    await safeEdit(
+      env,
+      cq,
+      "🌍 <b>Выбери часовой пояс</b>\n\nПо нему считаются день/месяц и время напоминаний.",
+      tzKb()
+    );
+    await answerCb(env, cq.id);
+    return;
+  }
+  if (data === "tz:custom") {
+    user.state = "set_tz_offset";
+    user.state_data = null;
+    await saveUser(env, user);
+    await send(
+      env,
+      from.id,
+      "Пришли смещение от UTC, напр. <code>+4</code> (Самара), <code>+3</code> (Москва), <code>-3</code> (Рио).\n(/cancel — отмена)"
+    );
+    await answerCb(env, cq.id);
+    return;
+  }
+  if (data.startsWith("tz:")) {
+    const i = parseInt(data.slice(3), 10);
+    if (!TZ_LIST[i]) {
+      await answerCb(env, cq.id, "Не найдено");
+      return;
+    }
+    user.tz = TZ_LIST[i][1];
+    await saveUser(env, user);
+    await answerCb(env, cq.id, "Часовой пояс обновлён ✅");
+    await safeEdit(env, cq, settingsText(), await settingsKb(env, user));
     return;
   }
   if (data === "set:budget") {
